@@ -1,0 +1,1960 @@
+
+#include <iostream>
+#include <stdio.h>
+#include <assert.h>
+#include <string.h> /* memcpy */
+#include <jpeglib.h>
+
+#include "cpu_id.h"
+#include "scale.h"
+
+// Supported filtering.
+typedef enum FilterMode {
+  kFilterNone = 0,      // Point sample; Fastest.
+  kFilterLinear = 1,    // Filter horizontally only.
+  kFilterBilinear = 2,  // Faster than box, but lower quality scaling down.
+  kFilterBox = 3        // Highest quality.
+} FilterModeEnum;
+
+static __inline int Abs(int v) {
+  return v >= 0 ? v : -v;
+}
+
+void RGB24ToARGBRow_C(const uint8_t* src_rgb24, uint8_t* dst_argb, int width) {
+  int x;
+  for (x = 0; x < width; ++x) {
+    uint8_t b = src_rgb24[0];
+    uint8_t g = src_rgb24[1];
+    uint8_t r = src_rgb24[2];
+    dst_argb[0] = b;
+    dst_argb[1] = g;
+    dst_argb[2] = r;
+    dst_argb[3] = 255u;
+    dst_argb += 4;
+    src_rgb24 += 3;
+  }
+}
+
+void (*RGB24ToARGBRow)(const uint8_t* src_rgb, uint8_t* dst_argb, int width);
+
+int RGB24ToARGB(const uint8_t* src_rgb24,
+                int src_stride_rgb24,
+                uint8_t* dst_argb,
+                int dst_stride_argb,
+                int width,
+                int height) {
+  int y;
+  if (!src_rgb24 || !dst_argb || width <= 0 || height == 0) {
+    return -1;
+  }
+  // Negative height means invert the image.
+  if (height < 0) {
+    height = -height;
+    src_rgb24 = src_rgb24 + (height - 1) * src_stride_rgb24;
+    src_stride_rgb24 = -src_stride_rgb24;
+  }
+  // Coalesce rows.
+  if (src_stride_rgb24 == width * 3 && dst_stride_argb == width * 4) {
+    width *= height;
+    height = 1;
+    src_stride_rgb24 = dst_stride_argb = 0;
+  }
+
+  for (y = 0; y < height; ++y) {
+    RGB24ToARGBRow(src_rgb24, dst_argb, width);
+    src_rgb24 += src_stride_rgb24;
+    dst_argb += dst_stride_argb;
+  }
+  return 0;
+}
+
+void ARGBToRGB24Row_C(const uint8_t* src_argb, uint8_t* dst_rgb, int width) {
+  int x;
+  for (x = 0; x < width; ++x) {
+    uint8_t b = src_argb[0];
+    uint8_t g = src_argb[1];
+    uint8_t r = src_argb[2];
+    dst_rgb[0] = b;
+    dst_rgb[1] = g;
+    dst_rgb[2] = r;
+    dst_rgb += 3;
+    src_argb += 4;
+  }
+}
+
+void (*ARGBToRGB24Row)(const uint8_t* src_argb, uint8_t* dst_rgb, int width);
+
+int ARGBToRGB24(const uint8_t* src_argb,
+                int src_stride_argb,
+                uint8_t* dst_rgb24,
+                int dst_stride_rgb24,
+                int width,
+                int height) {
+  int y;
+  if (!src_argb || !dst_rgb24 || width <= 0 || height == 0) {
+    return -1;
+  }
+  if (height < 0) {
+    height = -height;
+    src_argb = src_argb + (height - 1) * src_stride_argb;
+    src_stride_argb = -src_stride_argb;
+  }
+  // Coalesce rows.
+  if (src_stride_argb == width * 4 && dst_stride_rgb24 == width * 3) {
+    width *= height;
+    height = 1;
+    src_stride_argb = dst_stride_rgb24 = 0;
+  }
+
+  for (y = 0; y < height; ++y) {
+    ARGBToRGB24Row(src_argb, dst_rgb24, width);
+    src_argb += src_stride_argb;
+    dst_rgb24 += dst_stride_rgb24;
+  }
+  return 0;
+}
+
+// Blend 2 rows into 1.
+static inline void HalfRow_C(const uint8_t* src_uv,
+                      ptrdiff_t src_uv_stride,
+                      uint8_t* dst_uv,
+                      int width) {
+  int x;
+  for (x = 0; x < width; ++x) {
+    dst_uv[x] = (src_uv[x] + src_uv[src_uv_stride + x] + 1) >> 1;
+  }
+}
+
+// C version 2x2 -> 2x1.
+void InterpolateRow_C(uint8_t* dst_ptr,
+                      const uint8_t* src_ptr,
+                      ptrdiff_t src_stride,
+                      int width,
+                      int source_y_fraction) {
+  int y1_fraction = source_y_fraction;
+  int y0_fraction = 256 - y1_fraction;
+  const uint8_t* src_ptr1 = src_ptr + src_stride;
+  int x;
+  assert(source_y_fraction >= 0);
+  assert(source_y_fraction < 256);
+
+  if (y1_fraction == 0) {
+    memcpy(dst_ptr, src_ptr, width);
+    return;
+  }
+  if (y1_fraction == 128) {
+    HalfRow_C(src_ptr, src_stride, dst_ptr, width);
+    return;
+  }
+  for (x = 0; x < width; ++x) {
+    dst_ptr[0] =
+        (src_ptr[0] * y0_fraction + src_ptr1[0] * y1_fraction + 128) >> 8;
+    ++src_ptr;
+    ++src_ptr1;
+    ++dst_ptr;
+  }
+}
+
+// TODO(fbarchard): Replace 0x7f ^ f with 128-f.  bug=607.
+// Mimics SSSE3 blender
+#define BLENDER1(a, b, f) ((a) * (0x7f ^ f) + (b)*f) >> 7
+#define BLENDERC(a, b, f, s) \
+  (uint32_t)(BLENDER1(((a) >> s) & 255, ((b) >> s) & 255, f) << s)
+#define BLENDER(a, b, f)                                                 \
+  BLENDERC(a, b, f, 24) | BLENDERC(a, b, f, 16) | BLENDERC(a, b, f, 8) | \
+      BLENDERC(a, b, f, 0)
+
+void ScaleARGBFilterCols_C(uint8_t* dst_argb,
+                           const uint8_t* src_argb,
+                           int dst_width,
+                           int x,
+                           int dx) {
+  const uint32_t* src = (const uint32_t*)(src_argb);
+  uint32_t* dst = (uint32_t*)(dst_argb);
+  int j;
+  for (j = 0; j < dst_width - 1; j += 2) {
+    int xi = x >> 16;
+    int xf = (x >> 9) & 0x7f;
+    uint32_t a = src[xi];
+    uint32_t b = src[xi + 1];
+    dst[0] = BLENDER(a, b, xf);
+    x += dx;
+    xi = x >> 16;
+    xf = (x >> 9) & 0x7f;
+    a = src[xi];
+    b = src[xi + 1];
+    dst[1] = BLENDER(a, b, xf);
+    x += dx;
+    dst += 2;
+  }
+  if (dst_width & 1) {
+    int xi = x >> 16;
+    int xf = (x >> 9) & 0x7f;
+    uint32_t a = src[xi];
+    uint32_t b = src[xi + 1];
+    dst[0] = BLENDER(a, b, xf);
+  }
+}
+
+// Scales a single row of pixels using point sampling.
+void ScaleARGBCols_C(uint8_t* dst_argb,
+                     const uint8_t* src_argb,
+                     int dst_width,
+                     int x,
+                     int dx) {
+  const uint32_t* src = (const uint32_t*)(src_argb);
+  uint32_t* dst = (uint32_t*)(dst_argb);
+  int j;
+  for (j = 0; j < dst_width - 1; j += 2) {
+    dst[0] = src[x >> 16];
+    x += dx;
+    dst[1] = src[x >> 16];
+    x += dx;
+    dst += 2;
+  }
+  if (dst_width & 1) {
+    dst[0] = src[x >> 16];
+  }
+}
+
+
+// Scales a single row of pixels up by 2x using point sampling.
+void ScaleARGBColsUp2_C(uint8_t* dst_argb,
+                        const uint8_t* src_argb,
+                        int dst_width,
+                        int x,
+                        int dx) {
+  const uint32_t* src = (const uint32_t*)(src_argb);
+  uint32_t* dst = (uint32_t*)(dst_argb);
+  int j;
+  (void)x;
+  (void)dx;
+  for (j = 0; j < dst_width - 1; j += 2) {
+    dst[1] = dst[0] = src[0];
+    src += 1;
+    dst += 2;
+  }
+  if (dst_width & 1) {
+    dst[0] = src[0];
+  }
+}
+
+#define align_buffer_64(var, size)                                           \
+  uint8_t* var##_mem = (uint8_t*)(malloc((size) + 63));         /* NOLINT */ \
+  uint8_t* var = (uint8_t*)(((intptr_t)(var##_mem) + 63) & ~63) /* NOLINT */
+
+#define free_aligned_buffer_64(var) \
+  free(var##_mem);                  \
+  var = 0
+
+void (*InterpolateRow)(uint8_t * dst_argb, const uint8_t* src_argb,
+                         ptrdiff_t src_stride, int dst_width,
+                         int source_y_fraction);
+
+void (*ScaleARGBFilterCols)(uint8_t * dst_argb, const uint8_t* src_argb,
+                              int dst_width, int x, int dx);
+
+// Scale ARGB up with bilinear interpolation.
+static void ScaleARGBBilinearUp(int src_width,
+                                int src_height,
+                                int dst_width,
+                                int dst_height,
+                                int src_stride,
+                                const uint8_t* src_rgb,
+                                int x,
+                                int dx,
+                                int y,
+                                int dy,
+                                enum FilterMode filtering) {
+  int j;
+  const int max_y = (src_height - 1) << 16;
+
+  if (y > max_y) {
+    y = max_y;
+  }
+
+    FILE *file_out = fopen("dst_rgb.bmp", "w+t");
+
+  {
+    int yi = y >> 16;
+    const uint8_t* src = src_rgb + yi * (int64_t)src_stride;
+
+    // Allocate 2 rows of ARGB.
+    const int kRowSize = (dst_width * 4 + 31) & ~31;
+    align_buffer_64(row, kRowSize * 2);
+
+    uint8_t* rowptr = row;
+    int rowstride = kRowSize;
+    int lasty = yi;
+
+    uint8_t* src_argb = (uint8_t*)malloc(src_width * 4);
+    uint8_t* dst_argb = (uint8_t*)malloc(dst_width * 4);
+    uint8_t* dst_rgb = (uint8_t*)malloc(dst_width * 3);
+    RGB24ToARGB(src, src_stride, src_argb, src_width * 4, src_width, 1);
+    ScaleARGBFilterCols(rowptr, src_argb, dst_width, x, dx);
+    if (src_height > 1) {
+      src += src_stride;
+    }
+
+    RGB24ToARGB(src, src_stride, src_argb, src_width * 4, src_width, 1);
+    ScaleARGBFilterCols(rowptr + rowstride, src_argb, dst_width, x, dx);
+    if (src_height > 2) {
+      src += src_stride;
+    }
+
+    for (j = 0; j < dst_height; ++j) {
+      yi = y >> 16;
+      if (yi != lasty) {
+        if (y > max_y) {
+          y = max_y;
+          yi = y >> 16;
+          src = src_argb + yi * (int64_t)src_stride;
+        }
+        if (yi != lasty) {
+            RGB24ToARGB(src, src_stride, src_argb, src_width * 4, src_width, 1);
+            ScaleARGBFilterCols(rowptr, src_argb, dst_width, x, dx);
+            rowptr += rowstride;
+            rowstride = -rowstride;
+            lasty = yi;
+            if ((y + 65536) < max_y) {
+                src += src_stride;
+            }
+        }
+      }
+      if (filtering == kFilterLinear) {
+        InterpolateRow(dst_argb, rowptr, 0, dst_width * 4, 0);
+      } else {
+        int yf = (y >> 8) & 255;
+        InterpolateRow(dst_argb, rowptr, rowstride, dst_width * 4, yf);
+      }
+
+      ARGBToRGB24(dst_argb, dst_width * 4, dst_rgb, dst_width * 3, dst_width, 1);
+      fwrite(dst_rgb, dst_width * 3, 1, file_out);
+      fflush(file_out);
+      y += dy;
+    }
+    free_aligned_buffer_64(row);
+  }
+
+  fclose(file_out);
+}
+
+// Divide num by div and return as 16.16 fixed point result.
+int FixedDiv_C(int num, int div) {
+  return (int)(((int64_t)(num) << 16) / div);
+}
+
+// Divide num - 1 by div - 1 and return as 16.16 fixed point result.
+int FixedDiv1_C(int num, int div) {
+  return (int)((((int64_t)(num) << 16) - 0x00010001) / (div - 1));
+}
+
+#define CENTERSTART(dx, s) (dx < 0) ? -((-dx >> 1) + s) : ((dx >> 1) + s)
+
+// Compute slope values for stepping.
+void ScaleSlope(int src_width,
+                int src_height,
+                int dst_width,
+                int dst_height,
+                enum FilterMode filtering,
+                int* x,
+                int* y,
+                int* dx,
+                int* dy) {
+  assert(x != NULL);
+  assert(y != NULL);
+  assert(dx != NULL);
+  assert(dy != NULL);
+  assert(src_width != 0);
+  assert(src_height != 0);
+  assert(dst_width > 0);
+  assert(dst_height > 0);
+  // Check for 1 pixel and avoid FixedDiv overflow.
+  if (dst_width == 1 && src_width >= 32768) {
+    dst_width = src_width;
+  }
+  if (dst_height == 1 && src_height >= 32768) {
+    dst_height = src_height;
+  }
+  if (filtering == kFilterBox) {
+    // Scale step for point sampling duplicates all pixels equally.
+    *dx = FixedDiv(Abs(src_width), dst_width);
+    *dy = FixedDiv(src_height, dst_height);
+    *x = 0;
+    *y = 0;
+  } else if (filtering == kFilterBilinear) {
+    // Scale step for bilinear sampling renders last pixel once for upsample.
+    if (dst_width <= Abs(src_width)) {
+      *dx = FixedDiv(Abs(src_width), dst_width);
+      *x = CENTERSTART(*dx, -32768);  // Subtract 0.5 (32768) to center filter.
+    } else if (src_width > 1 && dst_width > 1) {
+      *dx = FixedDiv1(Abs(src_width), dst_width);
+      *x = 0;
+    }
+    if (dst_height <= src_height) {
+      *dy = FixedDiv(src_height, dst_height);
+      *y = CENTERSTART(*dy, -32768);  // Subtract 0.5 (32768) to center filter.
+    } else if (src_height > 1 && dst_height > 1) {
+      *dy = FixedDiv1(src_height, dst_height);
+      *y = 0;
+    }
+  } else if (filtering == kFilterLinear) {
+    // Scale step for bilinear sampling renders last pixel once for upsample.
+    if (dst_width <= Abs(src_width)) {
+      *dx = FixedDiv(Abs(src_width), dst_width);
+      *x = CENTERSTART(*dx, -32768);  // Subtract 0.5 (32768) to center filter.
+    } else if (src_width > 1 && dst_width > 1) {
+      *dx = FixedDiv1(Abs(src_width), dst_width);
+      *x = 0;
+    }
+    *dy = FixedDiv(src_height, dst_height);
+    *y = *dy >> 1;
+  } else {
+    // Scale step for point sampling duplicates all pixels equally.
+    *dx = FixedDiv(Abs(src_width), dst_width);
+    *dy = FixedDiv(src_height, dst_height);
+    *x = CENTERSTART(*dx, 0);
+    *y = CENTERSTART(*dy, 0);
+  }
+  // Negative src_width means horizontally mirror.
+  if (src_width < 0) {
+    *x += (dst_width - 1) * *dx;
+    *dx = -*dx;
+    // src_width = -src_width;   // Caller must do this.
+  }
+}
+#undef CENTERSTART
+
+static void ScaleARGB(const uint8_t* src,
+                      int src_stride,
+                      int src_width,
+                      int src_height,
+                      int dst_width,
+                      int dst_height,
+                      enum FilterMode filtering) {
+  // Initial source x/y coordinate and step values as 16.16 fixed point.
+  int x = 0;
+  int y = 0;
+  int dx = 0;   /* 水平方向缩放系数，<= 0xffff表示放大 */
+  int dy = 0;   /* 垂直方向缩放系数，<= 0xffff表示放大 */
+
+  ScaleSlope(src_width, src_height, dst_width, dst_height, filtering, &x, &y,
+             &dx, &dy);
+  src_width = Abs(src_width);
+
+  if (filtering && dy < 65536) {
+    ScaleARGBBilinearUp(src_width, src_height, dst_width, dst_height,
+                        src_stride, src, x, dx, y, dy, filtering);
+    return;
+  }
+#if 0
+  if (filtering) {
+    ScaleARGBBilinearDown(src_width, src_height, dst_width, dst_height,
+                          src_stride, dst_stride, src, dst, x, dx, y, dy,
+                          filtering);
+    return;
+  }
+  ScaleARGBSimple(src_width, src_height, dst_width, dst_height, src_stride,
+                  dst_stride, src, dst, x, dx, y, dy);
+#endif
+}
+
+int ARGBScale(const uint8_t* src_rgb,
+              int src_stride_argb,
+              int src_width,
+              int src_height,
+              int dst_width,
+              int dst_height,
+              enum FilterMode filtering) {
+  if (!src_rgb || src_width == 0 || src_height == 0 || src_width > 32768 ||
+      src_height > 32768 || dst_width <= 0 || dst_height <= 0) {
+    return -1;
+  }
+  ScaleARGB(src_rgb, src_stride_argb, src_width, src_height, dst_width, dst_height, filtering);
+  return 0;
+}
+
+int RGBScale(const uint8_t* src_rgb,
+             int src_stride_rgb,
+             int src_width,
+             int src_height,
+             int dst_width,
+             int dst_height,
+             enum FilterMode filtering) {
+    return ARGBScale(src_rgb, src_stride_rgb, src_width, src_height, dst_width, dst_height, filtering);
+}
+
+void RGB24ToARGBInit(int width)
+{
+    RGB24ToARGBRow = RGB24ToARGBRow_C;
+    if (width <= 0) {
+        return;
+    }
+
+#if defined(HAS_RGB24TOARGBROW_SSSE3)
+  if (TestCpuFlag(kCpuHasSSSE3)) {
+    std::cout<<"kCpuHasSSSE3" <<std::endl;
+    RGB24ToARGBRow = RGB24ToARGBRow_Any_SSSE3;
+    if (IS_ALIGNED(width, 16)) {
+      RGB24ToARGBRow = RGB24ToARGBRow_SSSE3;
+    }
+  }
+#endif
+#if defined(HAS_RGB24TOARGBROW_NEON)
+  if (TestCpuFlag(kCpuHasNEON)) {
+    std::cout<<"kCpuHasNEON" <<std::endl;
+    RGB24ToARGBRow = RGB24ToARGBRow_Any_NEON;
+    if (IS_ALIGNED(width, 8)) {
+      RGB24ToARGBRow = RGB24ToARGBRow_NEON;
+    }
+  }
+#endif
+#if defined(HAS_RGB24TOARGBROW_MSA)
+  if (1/* TestCpuFlag(kCpuHasMSA) */) {
+    RGB24ToARGBRow = RGB24ToARGBRow_Any_MSA;
+    if (IS_ALIGNED(width, 16)) {
+      RGB24ToARGBRow = RGB24ToARGBRow_MSA;
+    }
+  }
+#endif
+#if defined(HAS_RGB24TOARGBROW_LSX)
+  if (TestCpuFlag(kCpuHasLSX)) {
+    RGB24ToARGBRow = RGB24ToARGBRow_Any_LSX;
+    if (IS_ALIGNED(width, 16)) {
+      RGB24ToARGBRow = RGB24ToARGBRow_LSX;
+    }
+  }
+#endif
+#if defined(HAS_RGB24TOARGBROW_LASX)
+  if (TestCpuFlag(kCpuHasLASX)) {
+    RGB24ToARGBRow = RGB24ToARGBRow_Any_LASX;
+    if (IS_ALIGNED(width, 32)) {
+      RGB24ToARGBRow = RGB24ToARGBRow_LASX;
+    }
+  }
+#endif
+}
+
+void ARGBScaleInit( int src_width,
+                    int dst_width,
+                    enum FilterMode filtering )
+{
+    InterpolateRow = InterpolateRow_C;
+    ScaleARGBFilterCols = filtering ? ScaleARGBFilterCols_C : ScaleARGBCols_C;
+#if defined(HAS_INTERPOLATEROW_SSSE3)
+  if (TestCpuFlag(kCpuHasSSSE3)) {
+    InterpolateRow = InterpolateRow_Any_SSSE3;
+    if (IS_ALIGNED(dst_width, 4)) {
+      InterpolateRow = InterpolateRow_SSSE3;
+    }
+  }
+#endif
+#if defined(HAS_INTERPOLATEROW_AVX2)
+  if (TestCpuFlag(kCpuHasAVX2)) {
+    InterpolateRow = InterpolateRow_Any_AVX2;
+    if (IS_ALIGNED(dst_width, 8)) {
+      InterpolateRow = InterpolateRow_AVX2;
+    }
+  }
+#endif
+#if defined(HAS_INTERPOLATEROW_NEON)
+  if (TestCpuFlag(kCpuHasNEON)) {
+    std::cout<<"kCpuHasNEON" <<std::endl;
+    InterpolateRow = InterpolateRow_Any_NEON;
+    if (IS_ALIGNED(dst_width, 4)) {
+      InterpolateRow = InterpolateRow_NEON;
+    }
+  }
+#endif
+#if defined(HAS_INTERPOLATEROW_MSA)
+  if (1/* TestCpuFlag(kCpuHasMSA) */) {
+    std::cout<<"kCpuHasMSA" <<std::endl;
+    InterpolateRow = InterpolateRow_Any_MSA;
+    if (IS_ALIGNED(dst_width, 8)) {
+      InterpolateRow = InterpolateRow_MSA;
+    }
+  }
+#endif
+#if defined(HAS_INTERPOLATEROW_LSX)
+  if (TestCpuFlag(kCpuHasLSX)) {
+    InterpolateRow = InterpolateRow_Any_LSX;
+    if (IS_ALIGNED(dst_width, 8)) {
+      InterpolateRow = InterpolateRow_LSX;
+    }
+  }
+#endif
+#if 0
+    /* 暂不支持超大分辨率 */
+  if (src_width >= 32768) {
+    ScaleARGBFilterCols =
+        filtering ? ScaleARGBFilterCols64_C : ScaleARGBCols64_C;
+  }
+#endif
+#if defined(HAS_SCALEARGBFILTERCOLS_SSSE3)
+  if (filtering && TestCpuFlag(kCpuHasSSSE3) && src_width < 32768) {
+    ScaleARGBFilterCols = ScaleARGBFilterCols_SSSE3;
+  }
+#endif
+#if defined(HAS_SCALEARGBFILTERCOLS_NEON)
+  if (filtering && TestCpuFlag(kCpuHasNEON)) {
+    std::cout<<"kCpuHasNEON" <<std::endl;
+    ScaleARGBFilterCols = ScaleARGBFilterCols_Any_NEON;
+    if (IS_ALIGNED(dst_width, 4)) {
+      ScaleARGBFilterCols = ScaleARGBFilterCols_NEON;
+    }
+  }
+#endif
+#if defined(HAS_SCALEARGBFILTERCOLS_MSA)
+  if (filtering /* && TestCpuFlag(kCpuHasMSA) */) {
+    std::cout<<"kCpuHasMSA" <<std::endl;
+    ScaleARGBFilterCols = ScaleARGBFilterCols_Any_MSA;
+    if (IS_ALIGNED(dst_width, 8)) {
+      ScaleARGBFilterCols = ScaleARGBFilterCols_MSA;
+    }
+  }
+#endif
+#if defined(HAS_SCALEARGBFILTERCOLS_LSX)
+  if (filtering && TestCpuFlag(kCpuHasLSX)) {
+    ScaleARGBFilterCols = ScaleARGBFilterCols_Any_LSX;
+    if (IS_ALIGNED(dst_width, 8)) {
+      ScaleARGBFilterCols = ScaleARGBFilterCols_LSX;
+    }
+  }
+#endif
+#if defined(HAS_SCALEARGBCOLS_SSE2)
+  if (!filtering && TestCpuFlag(kCpuHasSSE2) && src_width < 32768) {
+    ScaleARGBFilterCols = ScaleARGBCols_SSE2;
+  }
+#endif
+#if defined(HAS_SCALEARGBCOLS_NEON)
+  if (!filtering && TestCpuFlag(kCpuHasNEON)) {
+    std::cout<<"kCpuHasNEON" <<std::endl;
+    ScaleARGBFilterCols = ScaleARGBCols_Any_NEON;
+    if (IS_ALIGNED(dst_width, 8)) {
+      ScaleARGBFilterCols = ScaleARGBCols_NEON;
+    }
+  }
+#endif
+#if defined(HAS_SCALEARGBCOLS_MSA)
+  if (!filtering /* && TestCpuFlag(kCpuHasMSA) */) {
+    std::cout<<"kCpuHasMSA" <<std::endl;
+    ScaleARGBFilterCols = ScaleARGBCols_Any_MSA;
+    if (IS_ALIGNED(dst_width, 4)) {
+      ScaleARGBFilterCols = ScaleARGBCols_MSA;
+    }
+  }
+#endif
+#if defined(HAS_SCALEARGBCOLS_LSX)
+  if (!filtering && TestCpuFlag(kCpuHasLSX)) {
+    ScaleARGBFilterCols = ScaleARGBCols_Any_LSX;
+    if (IS_ALIGNED(dst_width, 4)) {
+      ScaleARGBFilterCols = ScaleARGBCols_LSX;
+    }
+  }
+#endif
+  if (!filtering && src_width * 2 == dst_width) {
+    ScaleARGBFilterCols = ScaleARGBColsUp2_C;
+#if defined(HAS_SCALEARGBCOLSUP2_SSE2)
+    if (TestCpuFlag(kCpuHasSSE2) && IS_ALIGNED(dst_width, 8)) {
+      ScaleARGBFilterCols = ScaleARGBColsUp2_SSE2;
+    }
+#endif
+  }
+}
+
+void ARGBToRGB24Init(int width)
+{
+    ARGBToRGB24Row = ARGBToRGB24Row_C;
+
+#if defined(HAS_ARGBTORGB24ROW_SSSE3)
+  if (TestCpuFlag(kCpuHasSSSE3)) {
+    ARGBToRGB24Row = ARGBToRGB24Row_Any_SSSE3;
+    if (IS_ALIGNED(width, 16)) {
+      ARGBToRGB24Row = ARGBToRGB24Row_SSSE3;
+    }
+  }
+#endif
+#if defined(HAS_ARGBTORGB24ROW_AVX2)
+  if (TestCpuFlag(kCpuHasAVX2)) {
+    ARGBToRGB24Row = ARGBToRGB24Row_Any_AVX2;
+    if (IS_ALIGNED(width, 32)) {
+      ARGBToRGB24Row = ARGBToRGB24Row_AVX2;
+    }
+  }
+#endif
+#if defined(HAS_ARGBTORGB24ROW_AVX512VBMI)
+  if (TestCpuFlag(kCpuHasAVX512VBMI)) {
+    ARGBToRGB24Row = ARGBToRGB24Row_Any_AVX512VBMI;
+    if (IS_ALIGNED(width, 32)) {
+      ARGBToRGB24Row = ARGBToRGB24Row_AVX512VBMI;
+    }
+  }
+#endif
+#if defined(HAS_ARGBTORGB24ROW_NEON)
+  if (TestCpuFlag(kCpuHasNEON)) {
+    std::cout<<"kCpuHasNEON" <<std::endl;
+    ARGBToRGB24Row = ARGBToRGB24Row_Any_NEON;
+    if (IS_ALIGNED(width, 16)) {
+      ARGBToRGB24Row = ARGBToRGB24Row_NEON;
+    }
+  }
+#endif
+#if defined(HAS_ARGBTORGB24ROW_MSA)
+  if (1/* TestCpuFlag(kCpuHasMSA) */) {
+    std::cout<<"kCpuHasMSA" <<std::endl;
+    ARGBToRGB24Row = ARGBToRGB24Row_Any_MSA;
+    if (IS_ALIGNED(width, 16)) {
+      ARGBToRGB24Row = ARGBToRGB24Row_MSA;
+    }
+  }
+#endif
+#if defined(HAS_ARGBTORGB24ROW_LASX)
+  if (TestCpuFlag(kCpuHasLASX)) {
+    ARGBToRGB24Row = ARGBToRGB24Row_Any_LASX;
+    if (IS_ALIGNED(width, 32)) {
+      ARGBToRGB24Row = ARGBToRGB24Row_LASX;
+    }
+  }
+#endif
+}
+
+#define LINE_NUM_PRE_WRITE 16
+
+void ScaleInit( int src_width,
+                int dst_width,
+                enum FilterMode filtering )
+{
+    RGB24ToARGBInit(src_width);
+    ARGBScaleInit(src_width, dst_width, filtering);
+    ARGBToRGB24Init(dst_width * LINE_NUM_PRE_WRITE);
+}
+
+#define SRC_IMG_WIDTH   2560
+#define SRC_IMG_HEIGHT  1440
+
+#include <sys/time.h>   /* gettimeofday */
+
+// Scale ARGB up with bilinear interpolation.
+static void ScaleJpegRGBBilinearUp( struct jpeg_compress_struct *out_cinfo,
+                                    struct jpeg_decompress_struct *in_dinfo,
+                                    int x,
+                                    int dx,
+                                    int y,
+                                    int dy,
+                                    enum FilterMode filtering ) {
+    int i, j;
+    const int max_y = (out_cinfo->image_height - 1) << 16;
+
+    if (y > max_y) {
+        y = max_y;
+    }
+
+    int dst_width = out_cinfo->image_width;
+    int src_width = in_dinfo->image_width;
+
+    int src_rgb_stride = src_width * 3;
+    int src_argb_stride = src_width * 4;
+    int dst_rgb_stride = dst_width * 3;
+    int dst_argb_stride = dst_width * 4;
+
+    // JSAMPARRAY src_list = (JSAMPARRAY)malloc(sizeof(JSAMPROW*) * 3);
+	// memset(src_list, 0, sizeof(JSAMPROW*) * 3);
+    JSAMPARRAY dst_list = (JSAMPARRAY)malloc(sizeof(JSAMPROW*) * LINE_NUM_PRE_WRITE);
+    memset(dst_list, 0, sizeof(JSAMPROW*) * LINE_NUM_PRE_WRITE);
+
+    uint8_t* src_rgb = (uint8_t*)malloc(src_rgb_stride);
+    uint8_t* src_argb = (uint8_t*)malloc(src_argb_stride);
+    uint8_t* dst_argb = (uint8_t*)malloc(dst_argb_stride * LINE_NUM_PRE_WRITE);
+    uint8_t* dst_rgb = (uint8_t*)malloc(dst_rgb_stride * LINE_NUM_PRE_WRITE);
+
+    uint8_t* dst_argb_end = dst_argb + dst_argb_stride * (LINE_NUM_PRE_WRITE - 1);
+    uint8_t* dst_argb_ptr = dst_argb;
+    uint8_t*dst = dst_rgb;
+    for (i = 0; i < LINE_NUM_PRE_WRITE; ++i)
+    {
+        dst_list[i] = dst;
+        dst+= dst_rgb_stride;
+    }
+
+    {
+        int yi = y >> 16;
+        int tmp = yi;
+        while (tmp)
+        {
+            jpeg_read_scanlines(in_dinfo, &src_rgb, 1);
+            tmp--;
+        }
+
+        // Allocate 2 rows of ARGB.
+        const int kRowSize = (out_cinfo->image_width * 4 + 31) & ~31;
+        align_buffer_64(row, kRowSize * 2);
+
+        uint8_t* rowptr = row;
+        int rowstride = kRowSize;
+        int lasty = yi;
+
+        jpeg_read_scanlines(in_dinfo, &src_rgb, 1);
+        RGB24ToARGB(src_rgb, src_width*3, src_argb, src_width * 4, src_width, 1);
+        ScaleARGBFilterCols(rowptr, src_argb, dst_width, x, dx);
+
+        jpeg_read_scanlines(in_dinfo, &src_rgb, 1);
+        RGB24ToARGB(src_rgb, src_rgb_stride, src_argb, src_width * 4, src_width, 1);
+        ScaleARGBFilterCols(rowptr + rowstride, src_argb, dst_width, x, dx);
+
+        jpeg_read_scanlines(in_dinfo, &src_rgb, 1);
+
+        for (j = 0; j < out_cinfo->image_height; ++j) {
+            yi = y >> 16;
+            if (yi != lasty) {
+                if (y > max_y) {
+                    y = max_y;
+                    yi = y >> 16;
+                }
+                if (yi != lasty) {
+                    RGB24ToARGB(src_rgb, src_rgb_stride, src_argb, src_width * 4, src_width, 1);
+                    ScaleARGBFilterCols(rowptr, src_argb, dst_width, x, dx);
+                    rowptr += rowstride;
+                    rowstride = -rowstride;
+                    lasty = yi;
+                    if (in_dinfo->output_scanline < in_dinfo->output_height) {
+                        jpeg_read_scanlines(in_dinfo, &src_rgb, 1);
+                    }
+                }
+            }
+            if (filtering == kFilterLinear) {
+                InterpolateRow(dst_argb_ptr, rowptr, 0, dst_width * 4, 0);
+            } else {
+                int yf = (y >> 8) & 255;
+                InterpolateRow(dst_argb_ptr, rowptr, rowstride, dst_width * 4, yf);
+            }
+
+            if (dst_argb_ptr < dst_argb_end)
+            {
+                // std::cout << "11111"<<std::endl;
+                dst_argb_ptr += dst_argb_stride;
+            }
+            else
+            {
+                // std::cout << "jpeg_write_scanlines"<<std::endl;
+                ARGBToRGB24(dst_argb, dst_argb_stride, dst_rgb, dst_rgb_stride, dst_width * LINE_NUM_PRE_WRITE, 1);
+                jpeg_write_scanlines(out_cinfo, dst_list, LINE_NUM_PRE_WRITE);
+                dst_argb_ptr = dst_argb;
+            }
+
+            y += dy;
+        }
+        free_aligned_buffer_64(row);
+    }
+
+    free(src_rgb);
+    free(src_argb);
+    free(dst_argb);
+    free(dst_rgb);
+}
+
+static void ScaleJpegRGB(   struct jpeg_compress_struct *out_cinfo,
+                            struct jpeg_decompress_struct *in_dinfo,
+                            enum FilterMode filtering ) {
+  // Initial source x/y coordinate and step values as 16.16 fixed point.
+  int x = 0;
+  int y = 0;
+  int dx = 0;   /* 水平方向缩放系数，<= 0xffff表示放大 */
+  int dy = 0;   /* 垂直方向缩放系数，<= 0xffff表示放大 */
+
+  ScaleSlope(in_dinfo->image_width, in_dinfo->image_height, out_cinfo->image_width, out_cinfo->image_height, filtering, &x, &y,
+             &dx, &dy);
+
+  if (filtering && dy < 65536) {
+    ScaleJpegRGBBilinearUp(out_cinfo, in_dinfo, x, dx, y, dy, filtering);
+    return;
+  }
+#if 0
+  if (filtering) {
+    ScaleARGBBilinearDown(src_width, src_height, dst_width, dst_height,
+                          src_stride, dst_stride, src, dst, x, dx, y, dy,
+                          filtering);
+    return;
+  }
+  ScaleARGBSimple(src_width, src_height, dst_width, dst_height, src_stride,
+                  dst_stride, src, dst, x, dx, y, dy);
+#endif
+}
+
+// Sample position: (O is src sample position, X is dst sample position)
+//
+//      v dst_ptr at here           v stop at here
+//  X O X   X O X   X O X   X O X   X O X
+//    ^ src_ptr at here
+void ScaleRowUp2_Linear_C(const uint8_t* src_ptr,
+                          uint8_t* dst_ptr,
+                          int dst_width) {
+  int src_width = dst_width >> 1;
+  int x;
+  assert((dst_width % 2 == 0) && (dst_width >= 0));
+  for (x = 0; x < src_width; ++x) {
+    dst_ptr[2 * x + 0] = (src_ptr[x + 0] * 3 + src_ptr[x + 1] * 1 + 2) >> 2;
+    dst_ptr[2 * x + 1] = (src_ptr[x + 0] * 1 + src_ptr[x + 1] * 3 + 2) >> 2;
+  }
+}
+
+// Scale plane, horizontally up by 2 times.
+// Uses linear filter horizontally, nearest vertically.
+// This is an optimized version for scaling up a plane to 2 times of
+// its original width, using linear interpolation.
+// This is used to scale U and V planes of I422 to I444.
+void ScalePlaneUp2_Linear(int src_width,
+                          int src_height,
+                          int dst_width,
+                          int dst_height,
+                          int src_stride,
+                          int dst_stride,
+                          const uint8_t* src_ptr,
+                          uint8_t* dst_ptr) {
+  void (*ScaleRowUp)(const uint8_t* src_ptr, uint8_t* dst_ptr, int dst_width) =
+      ScaleRowUp2_Linear_Any_C;
+  int i;
+  int y;
+  int dy;
+
+  // This function can only scale up by 2 times horizontally.
+  assert(src_width == ((dst_width + 1) / 2));
+
+#ifdef HAS_SCALEROWUP2LINEAR_SSE2
+  if (TestCpuFlag(kCpuHasSSE2)) {
+    ScaleRowUp = ScaleRowUp2_Linear_Any_SSE2;
+  }
+#endif
+
+#ifdef HAS_SCALEROWUP2LINEAR_SSSE3
+  if (TestCpuFlag(kCpuHasSSSE3)) {
+    ScaleRowUp = ScaleRowUp2_Linear_Any_SSSE3;
+  }
+#endif
+
+#ifdef HAS_SCALEROWUP2LINEAR_AVX2
+  if (TestCpuFlag(kCpuHasAVX2)) {
+    ScaleRowUp = ScaleRowUp2_Linear_Any_AVX2;
+  }
+#endif
+
+#ifdef HAS_SCALEROWUP2LINEAR_NEON
+  if (TestCpuFlag(kCpuHasNEON)) {
+    ScaleRowUp = ScaleRowUp2_Linear_Any_NEON;
+  }
+#endif
+
+  if (dst_height == 1) {
+    ScaleRowUp(src_ptr + ((src_height - 1) / 2) * (int64_t)src_stride, dst_ptr,
+               dst_width);
+  } else {
+    dy = FixedDiv(src_height - 1, dst_height - 1);
+    y = (1 << 15) - 1;
+    for (i = 0; i < dst_height; ++i) {
+      ScaleRowUp(src_ptr + (y >> 16) * (int64_t)src_stride, dst_ptr, dst_width);
+      dst_ptr += dst_stride;
+      y += dy;
+    }
+  }
+}
+
+
+// Sample position: (O is src sample position, X is dst sample position)
+//
+//    src_ptr at here
+//  X v X   X   X   X   X   X   X   X   X
+//    O       O       O       O       O
+//  X   X   X   X   X   X   X   X   X   X
+//      ^ dst_ptr at here           ^ stop at here
+//  X   X   X   X   X   X   X   X   X   X
+//    O       O       O       O       O
+//  X   X   X   X   X   X   X   X   X   X
+void ScaleRowUp2_Bilinear_C(const uint8_t* src_ptr,
+                            ptrdiff_t src_stride,
+                            uint8_t* dst_ptr,
+                            ptrdiff_t dst_stride,
+                            int dst_width) {
+  const uint8_t* s = src_ptr;
+  const uint8_t* t = src_ptr + src_stride;
+  uint8_t* d = dst_ptr;
+  uint8_t* e = dst_ptr + dst_stride;
+  int src_width = dst_width >> 1;
+  int x;
+  assert((dst_width % 2 == 0) && (dst_width >= 0));
+  for (x = 0; x < src_width; ++x) {
+    d[2 * x + 0] =
+        (s[x + 0] * 9 + s[x + 1] * 3 + t[x + 0] * 3 + t[x + 1] * 1 + 8) >> 4;
+    d[2 * x + 1] =
+        (s[x + 0] * 3 + s[x + 1] * 9 + t[x + 0] * 1 + t[x + 1] * 3 + 8) >> 4;
+    e[2 * x + 0] =
+        (s[x + 0] * 3 + s[x + 1] * 1 + t[x + 0] * 9 + t[x + 1] * 3 + 8) >> 4;
+    e[2 * x + 1] =
+        (s[x + 0] * 1 + s[x + 1] * 3 + t[x + 0] * 3 + t[x + 1] * 9 + 8) >> 4;
+  }
+}
+
+// Scale plane, up by 2 times.
+// This is an optimized version for scaling up a plane to 2 times of
+// its original size, using bilinear interpolation.
+// This is used to scale U and V planes of I420 to I444.
+void ScalePlaneUp2_Bilinear(int src_width,
+                            int src_height,
+                            int dst_width,
+                            int dst_height,
+                            int src_stride,
+                            int dst_stride,
+                            const uint8_t* src_ptr,
+                            uint8_t* dst_ptr) {
+  void (*Scale2RowUp)(const uint8_t* src_ptr, ptrdiff_t src_stride,
+                      uint8_t* dst_ptr, ptrdiff_t dst_stride, int dst_width) =
+      ScaleRowUp2_Bilinear_Any_C;
+  int x;
+
+  // This function can only scale up by 2 times.
+  assert(src_width == ((dst_width + 1) / 2));
+  assert(src_height == ((dst_height + 1) / 2));
+
+#ifdef HAS_SCALEROWUP2BILINEAR_SSE2
+  if (TestCpuFlag(kCpuHasSSE2)) {
+    Scale2RowUp = ScaleRowUp2_Bilinear_Any_SSE2;
+  }
+#endif
+
+#ifdef HAS_SCALEROWUP2BILINEAR_SSSE3
+  if (TestCpuFlag(kCpuHasSSSE3)) {
+    Scale2RowUp = ScaleRowUp2_Bilinear_Any_SSSE3;
+  }
+#endif
+
+#ifdef HAS_SCALEROWUP2BILINEAR_AVX2
+  if (TestCpuFlag(kCpuHasAVX2)) {
+    Scale2RowUp = ScaleRowUp2_Bilinear_Any_AVX2;
+  }
+#endif
+
+#ifdef HAS_SCALEROWUP2BILINEAR_NEON
+  if (TestCpuFlag(kCpuHasNEON)) {
+    Scale2RowUp = ScaleRowUp2_Bilinear_Any_NEON;
+  }
+#endif
+
+  Scale2RowUp(src_ptr, 0, dst_ptr, 0, dst_width);
+  dst_ptr += dst_stride;
+  for (x = 0; x < src_height - 1; ++x) {
+    Scale2RowUp(src_ptr, src_stride, dst_ptr, dst_stride, dst_width);
+    src_ptr += src_stride;
+    // TODO(fbarchard): Test performance of writing one row of destination at a
+    // time.
+    dst_ptr += 2 * dst_stride;
+  }
+  if (!(dst_height & 1)) {
+    Scale2RowUp(src_ptr, 0, dst_ptr, 0, dst_width);
+  }
+}
+
+void ScaleFilterCols_C(uint8_t* dst_ptr,
+                       const uint8_t* src_ptr,
+                       int dst_width,
+                       int x,
+                       int dx) {
+  int j;
+  for (j = 0; j < dst_width - 1; j += 2) {
+    int xi = x >> 16;
+    int a = src_ptr[xi];
+    int b = src_ptr[xi + 1];
+    dst_ptr[0] = BLENDER(a, b, x & 0xffff);
+    x += dx;
+    xi = x >> 16;
+    a = src_ptr[xi];
+    b = src_ptr[xi + 1];
+    dst_ptr[1] = BLENDER(a, b, x & 0xffff);
+    x += dx;
+    dst_ptr += 2;
+  }
+  if (dst_width & 1) {
+    int xi = x >> 16;
+    int a = src_ptr[xi];
+    int b = src_ptr[xi + 1];
+    dst_ptr[0] = BLENDER(a, b, x & 0xffff);
+  }
+}
+
+// Scales a single row of pixels using point sampling.
+void ScaleCols_C(uint8_t* dst_ptr,
+                 const uint8_t* src_ptr,
+                 int dst_width,
+                 int x,
+                 int dx) {
+  int j;
+  for (j = 0; j < dst_width - 1; j += 2) {
+    dst_ptr[0] = src_ptr[x >> 16];
+    x += dx;
+    dst_ptr[1] = src_ptr[x >> 16];
+    x += dx;
+    dst_ptr += 2;
+  }
+  if (dst_width & 1) {
+    dst_ptr[0] = src_ptr[x >> 16];
+  }
+}
+
+// Scales a single row of pixels up by 2x using point sampling.
+void ScaleColsUp2_C(uint8_t* dst_ptr,
+                    const uint8_t* src_ptr,
+                    int dst_width,
+                    int x,
+                    int dx) {
+  int j;
+  (void)x;
+  (void)dx;
+  for (j = 0; j < dst_width - 1; j += 2) {
+    dst_ptr[1] = dst_ptr[0] = src_ptr[0];
+    src_ptr += 1;
+    dst_ptr += 2;
+  }
+  if (dst_width & 1) {
+    dst_ptr[0] = src_ptr[0];
+  }
+}
+
+// Scale up down with bilinear interpolation.
+void ScalePlaneBilinearUp(int src_width,
+                          int src_height,
+                          int dst_width,
+                          int dst_height,
+                          int src_stride,
+                          int dst_stride,
+                          const uint8_t* src_ptr,
+                          uint8_t* dst_ptr,
+                          enum FilterMode filtering) {
+  int j;
+  // Initial source x/y coordinate and step values as 16.16 fixed point.
+  int x = 0;
+  int y = 0;
+  int dx = 0;
+  int dy = 0;
+  const int max_y = (src_height - 1) << 16;
+  void (*InterpolateRow)(uint8_t * dst_ptr, const uint8_t* src_ptr,
+                         ptrdiff_t src_stride, int dst_width,
+                         int source_y_fraction) = InterpolateRow_C;
+  void (*ScaleFilterCols)(uint8_t * dst_ptr, const uint8_t* src_ptr,
+                          int dst_width, int x, int dx) =
+      filtering ? ScaleFilterCols_C : ScaleCols_C;
+  ScaleSlope(src_width, src_height, dst_width, dst_height, filtering, &x, &y,
+             &dx, &dy);
+  src_width = Abs(src_width);
+
+#if defined(HAS_INTERPOLATEROW_SSSE3)
+  if (TestCpuFlag(kCpuHasSSSE3)) {
+    InterpolateRow = InterpolateRow_Any_SSSE3;
+    if (IS_ALIGNED(dst_width, 16)) {
+      InterpolateRow = InterpolateRow_SSSE3;
+    }
+  }
+#endif
+#if defined(HAS_INTERPOLATEROW_AVX2)
+  if (TestCpuFlag(kCpuHasAVX2)) {
+    InterpolateRow = InterpolateRow_Any_AVX2;
+    if (IS_ALIGNED(dst_width, 32)) {
+      InterpolateRow = InterpolateRow_AVX2;
+    }
+  }
+#endif
+#if defined(HAS_INTERPOLATEROW_NEON)
+  if (TestCpuFlag(kCpuHasNEON)) {
+    InterpolateRow = InterpolateRow_Any_NEON;
+    if (IS_ALIGNED(dst_width, 16)) {
+      InterpolateRow = InterpolateRow_NEON;
+    }
+  }
+#endif
+#if 0
+  if (filtering && src_width >= 32768) {
+    ScaleFilterCols = ScaleFilterCols64_C;
+  }
+#endif
+#if defined(HAS_SCALEFILTERCOLS_SSSE3)
+  if (filtering && TestCpuFlag(kCpuHasSSSE3) && src_width < 32768) {
+    ScaleFilterCols = ScaleFilterCols_SSSE3;
+  }
+#endif
+#if defined(HAS_SCALEFILTERCOLS_NEON)
+  if (filtering && TestCpuFlag(kCpuHasNEON) && src_width < 32768) {
+    ScaleFilterCols = ScaleFilterCols_Any_NEON;
+    if (IS_ALIGNED(dst_width, 8)) {
+      ScaleFilterCols = ScaleFilterCols_NEON;
+    }
+  }
+#endif
+#if defined(HAS_SCALEFILTERCOLS_MSA)
+  if (filtering && TestCpuFlag(kCpuHasMSA) && src_width < 32768) {
+    ScaleFilterCols = ScaleFilterCols_Any_MSA;
+    if (IS_ALIGNED(dst_width, 16)) {
+      ScaleFilterCols = ScaleFilterCols_MSA;
+    }
+  }
+#endif
+#if defined(HAS_SCALEFILTERCOLS_LSX)
+  if (filtering && TestCpuFlag(kCpuHasLSX) && src_width < 32768) {
+    ScaleFilterCols = ScaleFilterCols_Any_LSX;
+    if (IS_ALIGNED(dst_width, 16)) {
+      ScaleFilterCols = ScaleFilterCols_LSX;
+    }
+  }
+#endif
+  if (!filtering && src_width * 2 == dst_width && x < 0x8000) {
+    ScaleFilterCols = ScaleColsUp2_C;
+#if defined(HAS_SCALECOLS_SSE2)
+    if (TestCpuFlag(kCpuHasSSE2) && IS_ALIGNED(dst_width, 8)) {
+      ScaleFilterCols = ScaleColsUp2_SSE2;
+    }
+#endif
+  }
+
+  if (y > max_y) {
+    y = max_y;
+  }
+  {
+    int yi = y >> 16;
+    const uint8_t* src = src_ptr + yi * (int64_t)src_stride;
+
+    // Allocate 2 row buffers.
+    const int kRowSize = (dst_width + 31) & ~31;
+    align_buffer_64(row, kRowSize * 2);
+
+    uint8_t* rowptr = row;
+    int rowstride = kRowSize;
+    int lasty = yi;
+
+    ScaleFilterCols(rowptr, src, dst_width, x, dx);
+    if (src_height > 1) {
+      src += src_stride;
+    }
+    ScaleFilterCols(rowptr + rowstride, src, dst_width, x, dx);
+    if (src_height > 2) {
+      src += src_stride;
+    }
+
+    for (j = 0; j < dst_height; ++j) {
+      yi = y >> 16;
+      if (yi != lasty) {
+        if (y > max_y) {
+          y = max_y;
+          yi = y >> 16;
+          src = src_ptr + yi * (int64_t)src_stride;
+        }
+        if (yi != lasty) {
+          ScaleFilterCols(rowptr, src, dst_width, x, dx);
+          rowptr += rowstride;
+          rowstride = -rowstride;
+          lasty = yi;
+          if ((y + 65536) < max_y) {
+            src += src_stride;
+          }
+        }
+      }
+      if (filtering == kFilterLinear) {
+        InterpolateRow(dst_ptr, rowptr, 0, dst_width, 0);
+      } else {
+        int yf = (y >> 8) & 255;
+        InterpolateRow(dst_ptr, rowptr, rowstride, dst_width, yf);
+      }
+      dst_ptr += dst_stride;
+      y += dy;
+    }
+    free_aligned_buffer_64(row);
+  }
+}
+
+void ScalePlane(const uint8_t* src,
+                int src_stride,
+                int src_width,
+                int src_height,
+                uint8_t* dst,
+                int dst_stride,
+                int dst_width,
+                int dst_height,
+                enum FilterMode filtering)
+{
+    if ((dst_width + 1) / 2 == src_width && filtering == kFilterLinear) {
+    ScalePlaneUp2_Linear(src_width, src_height, dst_width, dst_height,
+                         src_stride, dst_stride, src, dst);
+    return;
+  }
+  if ((dst_height + 1) / 2 == src_height && (dst_width + 1) / 2 == src_width &&
+      (filtering == kFilterBilinear || filtering == kFilterBox)) {
+    ScalePlaneUp2_Bilinear(src_width, src_height, dst_width, dst_height,
+                           src_stride, dst_stride, src, dst);
+    return;
+  }
+  if (filtering && dst_height > src_height) {
+    ScalePlaneBilinearUp(src_width, src_height, dst_width, dst_height,
+                         src_stride, dst_stride, src, dst, filtering);
+    return;
+  }
+}
+
+#ifndef HAS_SCALEUVBILINEARUP
+#define HAS_SCALEUVBILINEARUP 1
+#endif
+
+void ScaleUVRowUp2_Linear_C(const uint8_t* src_ptr,
+                            uint8_t* dst_ptr,
+                            int dst_width) {
+  int src_width = dst_width >> 1;
+  int x;
+  assert((dst_width % 2 == 0) && (dst_width >= 0));
+  for (x = 0; x < src_width; ++x) {
+    dst_ptr[4 * x + 0] =
+        (src_ptr[2 * x + 0] * 3 + src_ptr[2 * x + 2] * 1 + 2) >> 2;
+    dst_ptr[4 * x + 1] =
+        (src_ptr[2 * x + 1] * 3 + src_ptr[2 * x + 3] * 1 + 2) >> 2;
+    dst_ptr[4 * x + 2] =
+        (src_ptr[2 * x + 0] * 1 + src_ptr[2 * x + 2] * 3 + 2) >> 2;
+    dst_ptr[4 * x + 3] =
+        (src_ptr[2 * x + 1] * 1 + src_ptr[2 * x + 3] * 3 + 2) >> 2;
+  }
+}
+
+// Scale UV, horizontally up by 2 times.
+// Uses linear filter horizontally, nearest vertically.
+// This is an optimized version for scaling up a plane to 2 times of
+// its original width, using linear interpolation.
+// This is used to scale U and V planes of NV16 to NV24.
+void ScaleUVLinearUp2(int src_width,
+                      int src_height,
+                      int dst_width,
+                      int dst_height,
+                      int src_stride,
+                      int dst_stride,
+                      const uint8_t* src_uv,
+                      uint8_t* dst_uv) {
+  void (*ScaleRowUp)(const uint8_t* src_uv, uint8_t* dst_uv, int dst_width) =
+      ScaleUVRowUp2_Linear_Any_C;
+  int i;
+  int y;
+  int dy;
+
+  // This function can only scale up by 2 times horizontally.
+  assert(src_width == ((dst_width + 1) / 2));
+
+#ifdef HAS_SCALEUVROWUP2LINEAR_SSSE3
+  if (TestCpuFlag(kCpuHasSSSE3)) {
+    ScaleRowUp = ScaleUVRowUp2_Linear_Any_SSSE3;
+  }
+#endif
+
+#ifdef HAS_SCALEUVROWUP2LINEAR_AVX2
+  if (TestCpuFlag(kCpuHasAVX2)) {
+    ScaleRowUp = ScaleUVRowUp2_Linear_Any_AVX2;
+  }
+#endif
+
+#ifdef HAS_SCALEUVROWUP2LINEAR_NEON
+  if (TestCpuFlag(kCpuHasNEON)) {
+    ScaleRowUp = ScaleUVRowUp2_Linear_Any_NEON;
+  }
+#endif
+
+  if (dst_height == 1) {
+    ScaleRowUp(src_uv + ((src_height - 1) / 2) * (int64_t)src_stride, dst_uv,
+               dst_width);
+  } else {
+    dy = FixedDiv(src_height - 1, dst_height - 1);
+    y = (1 << 15) - 1;
+    for (i = 0; i < dst_height; ++i) {
+      ScaleRowUp(src_uv + (y >> 16) * (int64_t)src_stride, dst_uv, dst_width);
+      dst_uv += dst_stride;
+      y += dy;
+    }
+  }
+}
+
+void ScaleUVRowUp2_Bilinear_C(const uint8_t* src_ptr,
+                              ptrdiff_t src_stride,
+                              uint8_t* dst_ptr,
+                              ptrdiff_t dst_stride,
+                              int dst_width) {
+  const uint8_t* s = src_ptr;
+  const uint8_t* t = src_ptr + src_stride;
+  uint8_t* d = dst_ptr;
+  uint8_t* e = dst_ptr + dst_stride;
+  int src_width = dst_width >> 1;
+  int x;
+  assert((dst_width % 2 == 0) && (dst_width >= 0));
+  for (x = 0; x < src_width; ++x) {
+    d[4 * x + 0] = (s[2 * x + 0] * 9 + s[2 * x + 2] * 3 + t[2 * x + 0] * 3 +
+                    t[2 * x + 2] * 1 + 8) >>
+                   4;
+    d[4 * x + 1] = (s[2 * x + 1] * 9 + s[2 * x + 3] * 3 + t[2 * x + 1] * 3 +
+                    t[2 * x + 3] * 1 + 8) >>
+                   4;
+    d[4 * x + 2] = (s[2 * x + 0] * 3 + s[2 * x + 2] * 9 + t[2 * x + 0] * 1 +
+                    t[2 * x + 2] * 3 + 8) >>
+                   4;
+    d[4 * x + 3] = (s[2 * x + 1] * 3 + s[2 * x + 3] * 9 + t[2 * x + 1] * 1 +
+                    t[2 * x + 3] * 3 + 8) >>
+                   4;
+    e[4 * x + 0] = (s[2 * x + 0] * 3 + s[2 * x + 2] * 1 + t[2 * x + 0] * 9 +
+                    t[2 * x + 2] * 3 + 8) >>
+                   4;
+    e[4 * x + 1] = (s[2 * x + 1] * 3 + s[2 * x + 3] * 1 + t[2 * x + 1] * 9 +
+                    t[2 * x + 3] * 3 + 8) >>
+                   4;
+    e[4 * x + 2] = (s[2 * x + 0] * 1 + s[2 * x + 2] * 3 + t[2 * x + 0] * 3 +
+                    t[2 * x + 2] * 9 + 8) >>
+                   4;
+    e[4 * x + 3] = (s[2 * x + 1] * 1 + s[2 * x + 3] * 3 + t[2 * x + 1] * 3 +
+                    t[2 * x + 3] * 9 + 8) >>
+                   4;
+  }
+}
+
+// Scale plane, up by 2 times.
+// This is an optimized version for scaling up a plane to 2 times of
+// its original size, using bilinear interpolation.
+// This is used to scale U and V planes of NV12 to NV24.
+void ScaleUVBilinearUp2(int src_width,
+                        int src_height,
+                        int dst_width,
+                        int dst_height,
+                        int src_stride,
+                        int dst_stride,
+                        const uint8_t* src_ptr,
+                        uint8_t* dst_ptr) {
+  void (*Scale2RowUp)(const uint8_t* src_ptr, ptrdiff_t src_stride,
+                      uint8_t* dst_ptr, ptrdiff_t dst_stride, int dst_width) =
+      ScaleUVRowUp2_Bilinear_Any_C;
+  int x;
+
+  // This function can only scale up by 2 times.
+  assert(src_width == ((dst_width + 1) / 2));
+  assert(src_height == ((dst_height + 1) / 2));
+
+#ifdef HAS_SCALEUVROWUP2BILINEAR_SSSE3
+  if (TestCpuFlag(kCpuHasSSSE3)) {
+    Scale2RowUp = ScaleUVRowUp2_Bilinear_Any_SSSE3;
+  }
+#endif
+
+#ifdef HAS_SCALEUVROWUP2BILINEAR_AVX2
+  if (TestCpuFlag(kCpuHasAVX2)) {
+    Scale2RowUp = ScaleUVRowUp2_Bilinear_Any_AVX2;
+  }
+#endif
+
+#ifdef HAS_SCALEUVROWUP2BILINEAR_NEON
+  if (TestCpuFlag(kCpuHasNEON)) {
+    Scale2RowUp = ScaleUVRowUp2_Bilinear_Any_NEON;
+  }
+#endif
+
+  Scale2RowUp(src_ptr, 0, dst_ptr, 0, dst_width);
+  dst_ptr += dst_stride;
+  for (x = 0; x < src_height - 1; ++x) {
+    Scale2RowUp(src_ptr, src_stride, dst_ptr, dst_stride, dst_width);
+    src_ptr += src_stride;
+    // TODO(fbarchard): Test performance of writing one row of destination at a
+    // time.
+    dst_ptr += 2 * dst_stride;
+  }
+  if (!(dst_height & 1)) {
+    Scale2RowUp(src_ptr, 0, dst_ptr, 0, dst_width);
+  }
+}
+
+// Scales a single row of pixels using point sampling.
+void ScaleUVCols_C(uint8_t* dst_uv,
+                   const uint8_t* src_uv,
+                   int dst_width,
+                   int x,
+                   int dx) {
+  const uint16_t* src = (const uint16_t*)(src_uv);
+  uint16_t* dst = (uint16_t*)(dst_uv);
+  int j;
+  for (j = 0; j < dst_width - 1; j += 2) {
+    dst[0] = src[x >> 16];
+    x += dx;
+    dst[1] = src[x >> 16];
+    x += dx;
+    dst += 2;
+  }
+  if (dst_width & 1) {
+    dst[0] = src[x >> 16];
+  }
+}
+
+void ScaleUVFilterCols_C(uint8_t* dst_uv,
+                         const uint8_t* src_uv,
+                         int dst_width,
+                         int x,
+                         int dx) {
+  const uint16_t* src = (const uint16_t*)(src_uv);
+  uint16_t* dst = (uint16_t*)(dst_uv);
+  int j;
+  for (j = 0; j < dst_width - 1; j += 2) {
+    int xi = x >> 16;
+    int xf = (x >> 9) & 0x7f;
+    uint16_t a = src[xi];
+    uint16_t b = src[xi + 1];
+    dst[0] = BLENDER(a, b, xf);
+    x += dx;
+    xi = x >> 16;
+    xf = (x >> 9) & 0x7f;
+    a = src[xi];
+    b = src[xi + 1];
+    dst[1] = BLENDER(a, b, xf);
+    x += dx;
+    dst += 2;
+  }
+  if (dst_width & 1) {
+    int xi = x >> 16;
+    int xf = (x >> 9) & 0x7f;
+    uint16_t a = src[xi];
+    uint16_t b = src[xi + 1];
+    dst[0] = BLENDER(a, b, xf);
+  }
+}
+
+// Scales a single row of pixels up by 2x using point sampling.
+void ScaleUVColsUp2_C(uint8_t* dst_uv,
+                      const uint8_t* src_uv,
+                      int dst_width,
+                      int x,
+                      int dx) {
+  const uint16_t* src = (const uint16_t*)(src_uv);
+  uint16_t* dst = (uint16_t*)(dst_uv);
+  int j;
+  (void)x;
+  (void)dx;
+  for (j = 0; j < dst_width - 1; j += 2) {
+    dst[1] = dst[0] = src[0];
+    src += 1;
+    dst += 2;
+  }
+  if (dst_width & 1) {
+    dst[0] = src[0];
+  }
+}
+
+// Scale UV up with bilinear interpolation.
+#if HAS_SCALEUVBILINEARUP
+static void ScaleUVBilinearUp(int src_width,
+                              int src_height,
+                              int dst_width,
+                              int dst_height,
+                              int src_stride,
+                              int dst_stride,
+                              const uint8_t* src_uv,
+                              uint8_t* dst_uv,
+                              int x,
+                              int dx,
+                              int y,
+                              int dy,
+                              enum FilterMode filtering) {
+  int j;
+  void (*InterpolateRow)(uint8_t * dst_uv, const uint8_t* src_uv,
+                         ptrdiff_t src_stride, int dst_width,
+                         int source_y_fraction) = InterpolateRow_C;
+  void (*ScaleUVFilterCols)(uint8_t * dst_uv, const uint8_t* src_uv,
+                            int dst_width, int x, int dx) =
+      filtering ? ScaleUVFilterCols_C : ScaleUVCols_C;
+  const int max_y = (src_height - 1) << 16;
+#if defined(HAS_INTERPOLATEROW_SSSE3)
+  if (TestCpuFlag(kCpuHasSSSE3)) {
+    InterpolateRow = InterpolateRow_Any_SSSE3;
+    if (IS_ALIGNED(dst_width, 8)) {
+      InterpolateRow = InterpolateRow_SSSE3;
+    }
+  }
+#endif
+#if defined(HAS_INTERPOLATEROW_AVX2)
+  if (TestCpuFlag(kCpuHasAVX2)) {
+    InterpolateRow = InterpolateRow_Any_AVX2;
+    if (IS_ALIGNED(dst_width, 16)) {
+      InterpolateRow = InterpolateRow_AVX2;
+    }
+  }
+#endif
+#if defined(HAS_INTERPOLATEROW_NEON)
+  if (TestCpuFlag(kCpuHasNEON)) {
+    InterpolateRow = InterpolateRow_Any_NEON;
+    if (IS_ALIGNED(dst_width, 8)) {
+      InterpolateRow = InterpolateRow_NEON;
+    }
+  }
+#endif
+#if defined(HAS_INTERPOLATEROW_MSA)
+  if (TestCpuFlag(kCpuHasMSA)) {
+    InterpolateRow = InterpolateRow_Any_MSA;
+    if (IS_ALIGNED(dst_width, 16)) {
+      InterpolateRow = InterpolateRow_MSA;
+    }
+  }
+#endif
+#if defined(HAS_INTERPOLATEROW_LSX)
+  if (TestCpuFlag(kCpuHasLSX)) {
+    InterpolateRow = InterpolateRow_Any_LSX;
+    if (IS_ALIGNED(dst_width, 16)) {
+      InterpolateRow = InterpolateRow_LSX;
+    }
+  }
+#endif
+#if 0
+  if (src_width >= 32768) {
+    ScaleUVFilterCols = filtering ? ScaleUVFilterCols64_C : ScaleUVCols64_C;
+  }
+#endif
+#if defined(HAS_SCALEUVFILTERCOLS_SSSE3)
+  if (filtering && TestCpuFlag(kCpuHasSSSE3) && src_width < 32768) {
+    ScaleUVFilterCols = ScaleUVFilterCols_SSSE3;
+  }
+#endif
+#if defined(HAS_SCALEUVFILTERCOLS_NEON)
+  if (filtering && TestCpuFlag(kCpuHasNEON)) {
+    ScaleUVFilterCols = ScaleUVFilterCols_Any_NEON;
+    if (IS_ALIGNED(dst_width, 8)) {
+      ScaleUVFilterCols = ScaleUVFilterCols_NEON;
+    }
+  }
+#endif
+#if defined(HAS_SCALEUVFILTERCOLS_MSA)
+  if (filtering && TestCpuFlag(kCpuHasMSA)) {
+    ScaleUVFilterCols = ScaleUVFilterCols_Any_MSA;
+    if (IS_ALIGNED(dst_width, 16)) {
+      ScaleUVFilterCols = ScaleUVFilterCols_MSA;
+    }
+  }
+#endif
+#if defined(HAS_SCALEUVCOLS_SSSE3)
+  if (!filtering && TestCpuFlag(kCpuHasSSSE3) && src_width < 32768) {
+    ScaleUVFilterCols = ScaleUVCols_SSSE3;
+  }
+#endif
+#if defined(HAS_SCALEUVCOLS_NEON)
+  if (!filtering && TestCpuFlag(kCpuHasNEON)) {
+    ScaleUVFilterCols = ScaleUVCols_Any_NEON;
+    if (IS_ALIGNED(dst_width, 16)) {
+      ScaleUVFilterCols = ScaleUVCols_NEON;
+    }
+  }
+#endif
+#if defined(HAS_SCALEUVCOLS_MSA)
+  if (!filtering && TestCpuFlag(kCpuHasMSA)) {
+    ScaleUVFilterCols = ScaleUVCols_Any_MSA;
+    if (IS_ALIGNED(dst_width, 8)) {
+      ScaleUVFilterCols = ScaleUVCols_MSA;
+    }
+  }
+#endif
+  if (!filtering && src_width * 2 == dst_width && x < 0x8000) {
+    ScaleUVFilterCols = ScaleUVColsUp2_C;
+#if defined(HAS_SCALEUVCOLSUP2_SSSE3)
+    if (TestCpuFlag(kCpuHasSSSE3) && IS_ALIGNED(dst_width, 8)) {
+      ScaleUVFilterCols = ScaleUVColsUp2_SSSE3;
+    }
+#endif
+  }
+
+  if (y > max_y) {
+    y = max_y;
+  }
+
+  {
+    int yi = y >> 16;
+    const uint8_t* src = src_uv + yi * (int64_t)src_stride;
+
+    // Allocate 2 rows of UV.
+    const int kRowSize = (dst_width * 2 + 15) & ~15;
+    align_buffer_64(row, kRowSize * 2);
+
+    uint8_t* rowptr = row;
+    int rowstride = kRowSize;
+    int lasty = yi;
+
+    ScaleUVFilterCols(rowptr, src, dst_width, x, dx);
+    if (src_height > 1) {
+      src += src_stride;
+    }
+    ScaleUVFilterCols(rowptr + rowstride, src, dst_width, x, dx);
+    if (src_height > 2) {
+      src += src_stride;
+    }
+
+    for (j = 0; j < dst_height; ++j) {
+      yi = y >> 16;
+      if (yi != lasty) {
+        if (y > max_y) {
+          y = max_y;
+          yi = y >> 16;
+          src = src_uv + yi * (int64_t)src_stride;
+        }
+        if (yi != lasty) {
+          ScaleUVFilterCols(rowptr, src, dst_width, x, dx);
+          rowptr += rowstride;
+          rowstride = -rowstride;
+          lasty = yi;
+          if ((y + 65536) < max_y) {
+            src += src_stride;
+          }
+        }
+      }
+      if (filtering == kFilterLinear) {
+        InterpolateRow(dst_uv, rowptr, 0, dst_width * 2, 0);
+      } else {
+        int yf = (y >> 8) & 255;
+        InterpolateRow(dst_uv, rowptr, rowstride, dst_width * 2, yf);
+      }
+      dst_uv += dst_stride;
+      y += dy;
+    }
+    free_aligned_buffer_64(row);
+  }
+}
+#endif  // HAS_SCALEUVBILINEARUP
+
+// Scale a UV plane (from NV12)
+// This function in turn calls a scaling function
+// suitable for handling the desired resolutions.
+static void ScaleUV(const uint8_t* src,
+                    int src_stride,
+                    int src_width,
+                    int src_height,
+                    uint8_t* dst,
+                    int dst_stride,
+                    int dst_width,
+                    int dst_height,
+                    int clip_x,
+                    int clip_y,
+                    int clip_width,
+                    int clip_height,
+                    enum FilterMode filtering) {
+  // Initial source x/y coordinate and step values as 16.16 fixed point.
+  int x = 0;
+  int y = 0;
+  int dx = 0;
+  int dy = 0;
+//   // UV does not support box filter yet, but allow the user to pass it.
+//   // Simplify filtering when possible.
+//   filtering = ScaleFilterReduce(src_width, src_height, dst_width, dst_height,
+//                                 filtering);
+
+  // Negative src_height means invert the image.
+  if (src_height < 0) {
+    src_height = -src_height;
+    src = src + (src_height - 1) * (int64_t)src_stride;
+    src_stride = -src_stride;
+  }
+  ScaleSlope(src_width, src_height, dst_width, dst_height, filtering, &x, &y,
+             &dx, &dy);
+  src_width = Abs(src_width);
+  if (clip_x) {
+    int64_t clipf = (int64_t)(clip_x)*dx;
+    x += (clipf & 0xffff);
+    src += (clipf >> 16) * 2;
+    dst += clip_x * 2;
+  }
+  if (clip_y) {
+    int64_t clipf = (int64_t)(clip_y)*dy;
+    y += (clipf & 0xffff);
+    src += (clipf >> 16) * (int64_t)src_stride;
+    dst += clip_y * dst_stride;
+  }
+
+  // Special case for integer step values.
+  if (((dx | dy) & 0xffff) == 0) {
+    if (!dx || !dy) {  // 1 pixel wide and/or tall.
+      filtering = kFilterNone;
+    } else {
+      // Optimized even scale down. ie 2, 4, 6, 8, 10x.
+      if (!(dx & 0x10000) && !(dy & 0x10000)) {
+#if HAS_SCALEUVDOWN2
+        if (dx == 0x20000) {
+          // Optimized 1/2 downsample.
+          ScaleUVDown2(src_width, src_height, clip_width, clip_height,
+                       src_stride, dst_stride, src, dst, x, dx, y, dy,
+                       filtering);
+          return;
+        }
+#endif
+#if HAS_SCALEUVDOWN4BOX
+        if (dx == 0x40000 && filtering == kFilterBox) {
+          // Optimized 1/4 box downsample.
+          ScaleUVDown4Box(src_width, src_height, clip_width, clip_height,
+                          src_stride, dst_stride, src, dst, x, dx, y, dy);
+          return;
+        }
+#endif
+#if HAS_SCALEUVDOWNEVEN
+        ScaleUVDownEven(src_width, src_height, clip_width, clip_height,
+                        src_stride, dst_stride, src, dst, x, dx, y, dy,
+                        filtering);
+        return;
+#endif
+      }
+      // Optimized odd scale down. ie 3, 5, 7, 9x.
+      if ((dx & 0x10000) && (dy & 0x10000)) {
+        filtering = kFilterNone;
+#ifdef HAS_UVCOPY
+        if (dx == 0x10000 && dy == 0x10000) {
+          // Straight copy.
+          UVCopy(src + (y >> 16) * (int64_t)src_stride + (x >> 16) * 2,
+                 src_stride, dst, dst_stride, clip_width, clip_height);
+          return;
+        }
+#endif
+      }
+    }
+  }
+
+  if (filtering && (dst_width + 1) / 2 == src_width) {
+    ScaleUVLinearUp2(src_width, src_height, clip_width, clip_height, src_stride,
+                     dst_stride, src, dst);
+    return;
+  }
+  if ((clip_height + 1) / 2 == src_height &&
+      (clip_width + 1) / 2 == src_width &&
+      (filtering == kFilterBilinear || filtering == kFilterBox)) {
+    ScaleUVBilinearUp2(src_width, src_height, clip_width, clip_height,
+                       src_stride, dst_stride, src, dst);
+    return;
+  }
+#if HAS_SCALEUVBILINEARUP
+  if (filtering && dy < 65536) {
+    ScaleUVBilinearUp(src_width, src_height, clip_width, clip_height,
+                      src_stride, dst_stride, src, dst, x, dx, y, dy,
+                      filtering);
+    return;
+  }
+#endif
+#if HAS_SCALEUVBILINEARDOWN
+  if (filtering) {
+    ScaleUVBilinearDown(src_width, src_height, clip_width, clip_height,
+                        src_stride, dst_stride, src, dst, x, dx, y, dy,
+                        filtering);
+    return;
+  }
+#endif
+}
+
+int UVScale(const uint8_t* src_uv,
+            int src_stride_uv,
+            int src_width,
+            int src_height,
+            uint8_t* dst_uv,
+            int dst_stride_uv,
+            int dst_width,
+            int dst_height,
+            enum FilterMode filtering) {
+  if (!src_uv || src_width <= 0 || src_height == 0 || src_width > 32768 ||
+      src_height > 32768 || !dst_uv || dst_width <= 0 || dst_height <= 0) {
+    return -1;
+  }
+  ScaleUV(src_uv, src_stride_uv, src_width, src_height, dst_uv, dst_stride_uv,
+          dst_width, dst_height, 0, 0, dst_width, dst_height, filtering);
+  return 0;
+}
+
+void test_jpeg_scale()
+{
+    struct jpeg_decompress_struct dinfo;
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    struct jpeg_error_mgr pub;
+    dinfo.err = jpeg_std_error(&pub);
+    cinfo.err = jpeg_std_error(&jerr);
+
+    jpeg_create_decompress(&dinfo);
+    jpeg_create_compress(&cinfo);
+
+    FILE *infile = fopen("./test.jpg", "rb");
+    jpeg_stdio_src(&dinfo, infile);
+
+    FILE *outfile = fopen("./jpeg_scale_end.jpg", "wb");
+    jpeg_stdio_dest(&cinfo, outfile);
+
+    jpeg_read_header(&dinfo, TRUE);
+    dinfo.out_color_space = dinfo.jpeg_color_space;
+    dinfo.dct_method = JDCT_IFAST;
+    dinfo.do_fancy_upsampling = FALSE;
+    dinfo.do_block_smoothing = FALSE;
+    std::cout<<dinfo.image_width <<" "<< dinfo.image_height<<" channels:"<<dinfo.num_components<< std::endl;
+
+    jpeg_start_decompress(&dinfo);
+
+    cinfo.image_width = (dinfo.image_width*2.6);
+    cinfo.image_height = (dinfo.image_height*2.6);
+    cinfo.input_components = dinfo.num_components;
+    cinfo.in_color_space = dinfo.out_color_space;
+    jpeg_set_defaults(&cinfo);
+    // cinfo.optimize_coding = TRUE;
+    cinfo.dct_method = JDCT_IFAST;
+    jpeg_set_quality(&cinfo, 90, TRUE /* limit to baseline-JPEG values */);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    struct  timeval    tv;
+    gettimeofday(&tv, NULL);
+    std::cout<<tv.tv_sec*1000 + tv.tv_usec/1000 << std::endl;
+
+    ScaleInit(SRC_IMG_WIDTH, SRC_IMG_WIDTH *2, kFilterLinear);
+
+    // RGBScale(img_read, SRC_IMG_WIDTH *3, SRC_IMG_WIDTH, SRC_IMG_HEIGHT, SRC_IMG_WIDTH *2, SRC_IMG_HEIGHT*2, kFilterLinear);
+    ScaleJpegRGB(&cinfo, &dinfo, kFilterLinear);
+    jpeg_finish_decompress(&dinfo);
+    fclose(infile);
+    jpeg_destroy_decompress(&dinfo);
+
+    jpeg_finish_compress(&cinfo);
+    fclose(outfile);
+    jpeg_destroy_compress(&cinfo);
+
+    gettimeofday(&tv, NULL);
+    std::cout<<tv.tv_sec*1000 + tv.tv_usec/1000 << std::endl;
+}
+
+#define SUBSAMPLE(v, a, s) (v < 0) ? (-((-v + a) >> s)) : ((v + a) >> s)
+
+void test_nv12_scale()
+{
+    int src_width = 640;
+    int src_height = 360;
+    int dst_width = 640 * 3;
+    int dst_height = 360 * 3;
+
+    FILE *file_img = fopen("raw.yuv", "r+t");
+    int memsize = src_width*src_height*3 / 2;
+    unsigned char *img_read = (unsigned char *)malloc(memsize);
+    fread(img_read, 1, memsize, file_img);
+    fclose(file_img);
+
+    uint8_t* src_y = img_read;
+    uint8_t* src_uv = img_read + src_width*src_height;
+
+    int src_halfwidth = SUBSAMPLE(src_width, 1, 1);
+    int src_halfheight = SUBSAMPLE(src_height, 1, 1);
+    int dst_halfwidth = SUBSAMPLE(dst_width, 1, 1);
+    int dst_halfheight = SUBSAMPLE(dst_height, 1, 1);
+
+    memsize = dst_width * dst_height * 3/ 2;
+    uint8_t* img_dst = (uint8_t*)malloc(memsize);
+    uint8_t* dst_y = img_dst;
+    uint8_t* dst_uv = img_dst + dst_width * dst_height;
+
+    ScalePlane(src_y, src_width, src_width, src_height, dst_y, dst_width,
+             dst_width, dst_height, kFilterBilinear);
+    UVScale(src_uv, src_width, src_halfwidth, src_halfheight, dst_uv,
+            dst_width, dst_halfwidth, dst_halfheight, kFilterBilinear);
+
+    FILE *out = fopen("raw_scale.yuv", "w+t");
+    fwrite(img_dst, memsize, 1, out);
+    fflush(out);
+    fclose(out);
+
+    return;
+}
+
+int main()
+{
+    test_nv12_scale();
+
+    return 0;
+}
